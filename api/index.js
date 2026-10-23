@@ -1,11 +1,11 @@
 'use strict';
 
-// Vercel Function: barcha /api/* so'rovlari vercel.json orqali shu yerga keladi.
+// Vercel Function: barcha /api/* so'rovlari vercel.json rewrite orqali shu yerga keladi.
 
 const { handleRequest } = require('../lib/app');
 
 module.exports = (req, res) => {
-  // Rewrite asl manzilni ?__path= orqali uzatadi.
+  // Rewrite asl yo'lni ?__path= orqali uzatadi.
   const url = new URL(req.url || '/', 'http://localhost');
   const original = url.searchParams.get('__path');
   if (original !== null) {
