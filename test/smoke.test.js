@@ -44,7 +44,23 @@ async function waitForHealth(baseUrl, child, logs) {
   throw new Error(`Server did not become healthy.\n${logs()}`);
 }
 
-async function startServer({ port, dbPath, dataDir }) {
+async function startDatabase(dataDir) {
+  const { PGlite } = await import('@electric-sql/pglite');
+  const { PGLiteSocketServer } = await import('@electric-sql/pglite-socket');
+  const db = await PGlite.create(dataDir);
+  const port = await freePort();
+  const server = new PGLiteSocketServer({ db, port, host: '127.0.0.1' });
+  await server.start();
+  return {
+    url: `postgres://postgres:postgres@127.0.0.1:${port}/postgres`,
+    async stop() {
+      await server.stop();
+      await db.close();
+    },
+  };
+}
+
+async function startServer({ port, databaseUrl }) {
   let output = '';
   const child = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
@@ -52,8 +68,8 @@ async function startServer({ port, dbPath, dataDir }) {
       ...process.env,
       HOST: '127.0.0.1',
       PORT: String(port),
-      DB_PATH: dbPath,
-      DATA_DIR: dataDir,
+      DATABASE_URL: databaseUrl,
+      PG_POOL_MAX: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -143,59 +159,18 @@ class Client {
   }
 }
 
-async function openEventStream(client) {
-  const controller = new AbortController();
-  const response = await fetch(`${client.baseUrl}/api/events`, {
-    headers: { Accept: 'text/event-stream', Cookie: client.cookie },
-    signal: controller.signal,
-  });
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get('content-type') || '', /text\/event-stream/);
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  async function nextEvent(name) {
-    while (true) {
-      const boundary = buffer.indexOf('\n\n');
-      if (boundary >= 0) {
-        const block = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const eventName = block.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
-        const data = block
-          .split('\n')
-          .filter((line) => line.startsWith('data:'))
-          .map((line) => line.slice(5).trimStart())
-          .join('\n');
-        if (eventName === name) {
-          return JSON.parse(data);
-        }
-        continue;
-      }
-
-      const { value, done } = await reader.read();
-      if (done) throw new Error(`Event stream ended while waiting for ${name}.`);
-      buffer += decoder.decode(value, { stream: true });
-    }
-  }
-
-  return {
-    nextEvent,
-    close() {
-      controller.abort();
-      reader.cancel().catch(() => {});
-    },
-  };
+async function pollEvents(client, after) {
+  const query = after === undefined ? '' : `?after=${encodeURIComponent(after)}`;
+  const result = await client.request(`/api/events${query}`);
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  return result.payload;
 }
 
 test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60_000 }, async () => {
   const port = await freePort();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tasklove-smoke-'));
-  const dbPath = path.join(tempDir, 'smoke.db');
-  const dataDir = tempDir;
-  let server = await startServer({ port, dbPath, dataDir });
-  let stream = null;
+  const database = await startDatabase(path.join(tempDir, 'pgdata'));
+  let server = await startServer({ port, databaseUrl: database.url });
 
   try {
     const baseUrl = server.baseUrl;
@@ -256,9 +231,8 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
       /o'z vazifangizni/i,
     );
 
-    stream = await openEventStream(charlie);
-    await stream.nextEvent('ready');
-    const syncPromise = stream.nextEvent('sync');
+    const ready = await pollEvents(charlie);
+    assert.ok(ready.onlineUserIds.includes(charlieUser.id));
     const notifyTask = await alice.request('/api/tasks', {
       method: 'POST',
       body: {
@@ -268,14 +242,12 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
       },
     });
     assert.equal(notifyTask.status, 201);
-    const syncEvent = await Promise.race([
-      syncPromise,
-      delay(4000).then(() => { throw new Error('SSE sync event did not arrive.'); }),
-    ]);
+    const update = await pollEvents(charlie, ready.cursor);
+    assert.equal(update.events.length, 1);
+    const syncEvent = update.events[0];
     assert.equal(syncEvent.kind, 'task.created');
     assert.equal(syncEvent.taskId, notifyTask.payload.taskId);
-    stream.close();
-    stream = null;
+    assert.notEqual(update.cursor, ready.cursor);
 
     const beforeRace = await charlie.state();
     const beforePoints = new Map(beforeRace.users.map((user) => [user.id, user.points]));
@@ -332,7 +304,7 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     // Ma'lumotlar qayta ishga tushirilgandan keyin ham saqlanishi kerak.
     const oldCookie = charlie.cookie;
     await stopServer(server);
-    server = await startServer({ port, dbPath, dataDir });
+    server = await startServer({ port, databaseUrl: database.url });
     charlie.baseUrl = server.baseUrl;
     charlie.cookie = oldCookie;
     bob.baseUrl = server.baseUrl;
@@ -369,7 +341,10 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     assert.equal(finalState.users.length, 1);
     assert.equal(finalState.users[0].id, charlieUser.id);
     assert.equal(finalState.completions.some((item) => item.user_id === bobUser.id), false);
-    assert.equal(finalState.completions.some((item) => item.user_id === charlieUser.id), true);
+    assert.equal(
+      finalState.completions.some((item) => item.user_id === charlieUser.id),
+      winnerId === charlieUser.id,
+    );
     assert.equal(
       finalState.users.find((user) => user.id === charlieUser.id).points,
       pointsBeforeDelete,
@@ -378,12 +353,12 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     const staleSession = await alice.request('/api/state');
     assert.equal(staleSession.status, 401);
   } finally {
-    if (stream) stream.close();
     await stopServer(server);
+    await database.stop();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
-      // Windows ba'zan SQLite faylini bir zum ushlab turadi; test natijasiga ta'sir qilmaydi.
+      // Windows ba'zan fayllarni bir zum ushlab turadi; test natijasiga ta'sir qilmaydi.
     }
   }
 });

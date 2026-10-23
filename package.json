@@ -10,6 +10,13 @@
     "test": "node --test test/smoke.test.js"
   },
   "engines": {
-    "node": ">=24"
+    "node": "24.x"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11",
+    "@electric-sql/pglite-socket": "^0.2.14"
   }
 }

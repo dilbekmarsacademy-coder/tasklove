@@ -121,9 +121,13 @@ function setStreamStatus(online, label = null) {
   if (word) word.textContent = label || (online ? 'onlayn' : 'qayta ulanish');
 }
 
+const POLL_INTERVAL_MS = 3000;
+const POLL_HIDDEN_INTERVAL_MS = 15000;
+
 function disconnectStream() {
   if (app.events) {
-    app.events.close();
+    app.events.stopped = true;
+    clearTimeout(app.events.timer);
     app.events = null;
   }
   clearTimeout(app.reconnectTimer);
@@ -131,87 +135,68 @@ function disconnectStream() {
   setStreamStatus(false, 'ulanmoqda');
 }
 
+// Serverless muhitda doimiy ulanish yo‘q, shuning uchun hodisalarni
+// qisqa oraliqlarda so‘rab olamiz (/api/events?after=<cursor>).
 function connectStream() {
   if (!app.data) return;
   disconnectStream();
   setStreamStatus(false, 'ulanmoqda');
 
-  let source;
-  try {
-    source = new EventSource('/api/events');
-  } catch {
-    setStreamStatus(false, 'qayta ulanish');
-    return;
-  }
-  app.events = source;
+  const poller = { cursor: null, timer: null, stopped: false, failures: 0 };
+  app.events = poller;
 
-  source.addEventListener('open', () => {
-    clearTimeout(app.reconnectTimer);
-    app.reconnectTimer = null;
-    setStreamStatus(true);
-  });
-
-  source.addEventListener('ready', (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      if (Array.isArray(payload.onlineUserIds) && app.data) {
-        app.data.onlineUserIds = [...new Set(payload.onlineUserIds)];
-        updatePresenceUI();
-      }
-    } catch {
-      // noto‘g‘ri event — e'tiborsiz qoldiramiz
-    }
-    setStreamStatus(true);
-    // Qayta ulanish paytida o‘tkazib yuborilgan o‘zgarishlarni olamiz.
-    scheduleRefresh(null, 120);
-  });
-
-  source.addEventListener('presence', (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      if (Array.isArray(payload.onlineUserIds) && app.data) {
-        app.data.onlineUserIds = [...new Set(payload.onlineUserIds)];
-        updatePresenceUI();
-      }
-    } catch {
-      // ignore
-    }
-  });
-
-  source.addEventListener('sync', (event) => {
-    let payload = null;
-    try {
-      payload = JSON.parse(event.data);
-    } catch {
-      payload = null;
-    }
-    if (payload) handleRealtimeNotification(payload);
-    scheduleRefresh(payload, 170);
-  });
-
-  source.onerror = () => {
-    setStreamStatus(false, 'qayta ulanish');
-    clearTimeout(app.reconnectTimer);
-    app.reconnectTimer = setTimeout(verifySessionAfterDisconnect, 2600);
+  const schedule = (delay) => {
+    if (poller.stopped) return;
+    clearTimeout(poller.timer);
+    poller.timer = setTimeout(tick, delay);
   };
-}
 
-async function verifySessionAfterDisconnect() {
-  if (!app.data) return;
-  try {
-    const data = await api('/api/state', { allow401: true });
-    if (data === null) {
+  async function tick() {
+    if (poller.stopped || !app.data) return;
+    const query = poller.cursor === null ? '' : `?after=${encodeURIComponent(poller.cursor)}`;
+    let payload;
+    try {
+      payload = await api(`/api/events${query}`, { allow401: true });
+    } catch {
+      if (poller.stopped) return;
+      poller.failures += 1;
+      setStreamStatus(false, 'qayta ulanish');
+      schedule(Math.min(POLL_INTERVAL_MS * 2 ** poller.failures, 30000));
+      return;
+    }
+    if (poller.stopped) return;
+    if (payload === null) {
       handleUnauthorized();
       return;
     }
-    if (data && app.data) {
-      app.data = data;
-      renderApp();
+
+    const wasOffline = poller.failures > 0 || poller.cursor === null;
+    poller.failures = 0;
+    poller.cursor = payload.cursor;
+    setStreamStatus(true);
+
+    if (Array.isArray(payload.onlineUserIds) && app.data) {
+      app.data.onlineUserIds = [...new Set(payload.onlineUserIds)];
+      updatePresenceUI();
     }
-  } catch {
-    // Hali ham aloqa yo‘q — EventSource o‘zi qayta urinishda davom etadi.
+
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    for (const event of events) handleRealtimeNotification(event);
+    // Aloqa uzilgan paytda o‘tkazib yuborilgan o‘zgarishlarni ham olamiz.
+    if (events.length || wasOffline) scheduleRefresh(events[events.length - 1] || null, 120);
+
+    schedule(document.hidden ? POLL_HIDDEN_INTERVAL_MS : POLL_INTERVAL_MS);
   }
+
+  tick();
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && app.events && !app.events.stopped) {
+    clearTimeout(app.events.timer);
+    app.events.timer = setTimeout(() => connectStream(), 50);
+  }
+});
 
 function scheduleRefresh(meta, delay = 170) {
   clearTimeout(app.refreshTimer);
